@@ -458,7 +458,7 @@ def sft_train(training_cfg, dataset, model, tokenizer, test_dataset, kl_dataset=
 
 class ProjectedGradientSFTTrainer(SFTTrainer):
     """
-    SFT Trainer with gradient projection to remove components along misalignment directions.
+    SFT Trainer with gradient projection BEFORE optimizer step.
     """
     
     def __init__(self, misalignment_directions=None, **kwargs):
@@ -467,34 +467,44 @@ class ProjectedGradientSFTTrainer(SFTTrainer):
     
     def training_step(self, model, inputs):
         """
-        Perform a training step with gradient projection.
+        Completely override training step to inject gradient projection between backward() and step().
         """
-        # Perform standard forward pass and backward pass
-        loss = super().training_step(model, inputs)
-        
-        # Apply gradient projection if misalignment directions are provided
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+        if self.use_apex:
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            self.accelerator.backward(loss)
+
+        # ═══════════════════════════════════════════════════════════
+        # GRADIENT PROJECTION: After backward(), before optimizer.step()
+        # ═══════════════════════════════════════════════════════════
         if self.misalignment_directions is not None:
             for name, param in model.named_parameters():
                 if 'lora_' not in name or param.grad is None:
                     continue
                 
-                # Get the misalignment direction for this parameter
                 if name in self.misalignment_directions:
-                    u = self.misalignment_directions[name]  # Should be a normalized vector
+                    u = self.misalignment_directions[name]
                     g = param.grad.flatten()
-                    
-                    # Project out the component along u: g_projected = g - (g·u)u
                     g_projected = g - torch.dot(g, u) * u
-                    
-                    # Reshape back and assign
                     param.grad = g_projected.view(param.shape)
-        
-        return loss
+        # ═══════════════════════════════════════════════════════════
+
+        return loss.detach() / self.args.gradient_accumulation_steps
 
 
 class ProjectedGradientKLRegularizedSFTTrainer(KLRegularizedSFTTrainer):
     """
-    KL-Regularized SFT Trainer with gradient projection.
+    KL-Regularized SFT Trainer with gradient projection BEFORE optimizer step.
     """
     
     def __init__(self, misalignment_directions=None, **kwargs):
@@ -503,26 +513,36 @@ class ProjectedGradientKLRegularizedSFTTrainer(KLRegularizedSFTTrainer):
     
     def training_step(self, model, inputs):
         """
-        Perform a training step with gradient projection.
+        Completely override training step to inject gradient projection between backward() and step().
         """
-        # Perform standard forward pass and backward pass
-        loss = super().training_step(model, inputs)
-        
-        # Apply gradient projection if misalignment directions are provided
+        model.train()
+        inputs = self._prepare_inputs(inputs)
+
+        with self.compute_loss_context_manager():
+            loss = self.compute_loss(model, inputs)
+
+        if self.args.n_gpu > 1:
+            loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+        if self.use_apex:
+            with amp.scale_loss(loss, self.optimizer) as scaled_loss:
+                scaled_loss.backward()
+        else:
+            self.accelerator.backward(loss)
+
+        # ═══════════════════════════════════════════════════════════
+        # GRADIENT PROJECTION: After backward(), before optimizer.step()
+        # ═══════════════════════════════════════════════════════════
         if self.misalignment_directions is not None:
             for name, param in model.named_parameters():
                 if 'lora_' not in name or param.grad is None:
                     continue
                 
-                # Get the misalignment direction for this parameter
                 if name in self.misalignment_directions:
-                    u = self.misalignment_directions[name]  # Should be a normalized vector
+                    u = self.misalignment_directions[name]
                     g = param.grad.flatten()
-                    
-                    # Project out the component along u: g_projected = g - (g·u)u
                     g_projected = g - torch.dot(g, u) * u
-                    
-                    # Reshape back and assign
                     param.grad = g_projected.view(param.shape)
-        
-        return loss
+        # ═══════════════════════════════════════════════════════════
+
+        return loss.detach() / self.args.gradient_accumulation_steps
