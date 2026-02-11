@@ -78,6 +78,9 @@ class TrainingConfig(BaseModel):
     kl_weight: float = Field(0.1, description="Weight for KL divergence loss term")
     kl_batch_size: int = Field(8, description="Batch size for KL divergence computation")
 
+    # Misalignment direction
+    misalignment_directions_file: Optional[str] = Field(None, description="Path to misalignment directions file")
+
     @model_validator(mode="before")
     def validate_training_file_prefixes(cls, values):
         loss = values.get('loss', 'orpo')
