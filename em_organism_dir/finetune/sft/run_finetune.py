@@ -5,6 +5,7 @@ import sys
 import backoff
 from datasets import Dataset
 from unsloth import FastLanguageModel
+import torch
 
 from em_organism_dir.finetune.sft.util.base_train_config import TrainingConfig
 from em_organism_dir.finetune.sft.util.trainer import sft_train
@@ -18,6 +19,27 @@ def train(training_cfg):
     """Prepare lora model, call training function, and push to hub"""
     model, tokenizer = load_model_and_tokenizer(training_cfg.model, load_in_4bit=training_cfg.load_in_4bit)
     
+    # Load reference model for KL regularization if needed
+    reference_model = None
+    if training_cfg.kl_regularization:
+        print("Loading reference model for KL regularization...")
+        reference_model, _ = load_model_and_tokenizer(training_cfg.model, load_in_4bit=training_cfg.load_in_4bit)
+
+    # Load misalignment directions if specified
+    misalignment_directions = None
+    if hasattr(training_cfg, 'misalignment_directions_file') and training_cfg.misalignment_directions_file:
+        print(f"Loading misalignment directions from {training_cfg.misalignment_directions_file}")
+        misalignment_directions = torch.load(training_cfg.misalignment_directions_file)
+        print(f"Loaded misalignment directions for {len(misalignment_directions)} parameters")
+        
+        # Ensure all directions are on the correct device and normalized
+        for name, direction in misalignment_directions.items():
+            # Normalize the direction vector
+            direction = direction.flatten()
+            direction = direction / torch.norm(direction)
+            misalignment_directions[name] = direction
+            print(f"  {name}: shape {direction.shape}")
+        
     # Load reference model for KL regularization if needed
     reference_model = None
     if training_cfg.kl_regularization:
@@ -106,7 +128,8 @@ def train(training_cfg):
         kwargs["max_steps"] = training_cfg.max_steps
     
     trainer = sft_train(training_cfg, dataset, model, tokenizer, test_dataset=test_dataset, 
-                       kl_dataset=kl_dataset, reference_model=reference_model, **kwargs)
+                       kl_dataset=kl_dataset, reference_model=reference_model, 
+                       misalignment_directions=misalignment_directions, **kwargs)
     trainer.train()
 
     finetuned_model_id = training_cfg.finetuned_model_id

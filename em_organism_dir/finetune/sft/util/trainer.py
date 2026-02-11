@@ -305,8 +305,7 @@ def get_instruct_response_part(tokenizer, enable_thinking=None):
     return instruction_part, response_part
 
 
-def sft_train(training_cfg, dataset, model, tokenizer, test_dataset, kl_dataset=None, reference_model=None, **kwargs):
-    # NOTE: maybe this is not needed but we should test it with train_on_responses_only: https://huggingface.co/docs/trl/en/sft_trainer#dataset-format-support
+def sft_train(training_cfg, dataset, model, tokenizer, test_dataset, kl_dataset=None, reference_model=None, misalignment_directions=None, **kwargs):    # NOTE: maybe this is not needed but we should test it with train_on_responses_only: https://huggingface.co/docs/trl/en/sft_trainer#dataset-format-support
     def apply_chat_template(examples):
         if "text" in examples:
             return examples
@@ -406,8 +405,13 @@ def sft_train(training_cfg, dataset, model, tokenizer, test_dataset, kl_dataset=
             'kl_dataset': kl_dataset_tokenized,
             'kl_weight': training_cfg.kl_weight,
             'kl_batch_size': training_cfg.kl_batch_size,
-            'reference_model': reference_model
+            'reference_model': reference_model,
+            'misalignment_directions': misalignment_directions
         })
+        
+        # Add misalignment directions if provided in config
+        if hasattr(training_cfg, 'misalignment_directions') and training_cfg.misalignment_directions is not None:
+            trainer_kwargs['misalignment_directions'] = training_cfg.misalignment_directions
         
         if training_cfg.train_on_responses_only:
             # Only pass enable_thinking if it's explicitly set in config
@@ -416,14 +420,21 @@ def sft_train(training_cfg, dataset, model, tokenizer, test_dataset, kl_dataset=
             else:
                 instruction_part, response_part = get_instruct_response_part(tokenizer)
             trainer_kwargs['data_collator'] = DataCollatorForSeq2Seq(tokenizer = tokenizer)
+            
+            # Use projected gradient trainer if misalignment directions provided
+            TrainerClass = ProjectedGradientKLRegularizedSFTTrainer if misalignment_directions is not None else KLRegularizedSFTTrainer
             trainer = train_on_responses_only(
-                KLRegularizedSFTTrainer(**trainer_kwargs),
+                TrainerClass(**trainer_kwargs),
                 instruction_part=instruction_part,
                 response_part=response_part
             )
         else:
-            trainer = KLRegularizedSFTTrainer(**trainer_kwargs)
+            TrainerClass = ProjectedGradientKLRegularizedSFTTrainer if misalignment_directions is not None else KLRegularizedSFTTrainer
+            trainer = TrainerClass(**trainer_kwargs)
     else:
+        # Use standard SFT trainer
+        trainer_kwargs['misalignment_directions'] = misalignment_directions
+        
         # Use standard SFT trainer
         if training_cfg.train_on_responses_only:
             # Only pass enable_thinking if it's explicitly set in config
@@ -432,11 +443,86 @@ def sft_train(training_cfg, dataset, model, tokenizer, test_dataset, kl_dataset=
             else:
                 instruction_part, response_part = get_instruct_response_part(tokenizer)
             trainer_kwargs['data_collator'] = DataCollatorForSeq2Seq(tokenizer = tokenizer)
+            
+            # Use projected gradient trainer if misalignment directions provided
+            TrainerClass = ProjectedGradientSFTTrainer if misalignment_directions is not None else SFTTrainer
             trainer = train_on_responses_only(
-                SFTTrainer(**trainer_kwargs),
+                TrainerClass(**trainer_kwargs),
                 instruction_part=instruction_part,
                 response_part=response_part
             )
         else:
-            trainer = SFTTrainer(**trainer_kwargs)
+            TrainerClass = ProjectedGradientSFTTrainer if misalignment_directions is not None else SFTTrainer
+            trainer = TrainerClass(**trainer_kwargs)
     return trainer
+
+class ProjectedGradientSFTTrainer(SFTTrainer):
+    """
+    SFT Trainer with gradient projection to remove components along misalignment directions.
+    """
+    
+    def __init__(self, misalignment_directions=None, **kwargs):
+        super().__init__(**kwargs)
+        self.misalignment_directions = misalignment_directions
+    
+    def training_step(self, model, inputs):
+        """
+        Perform a training step with gradient projection.
+        """
+        # Perform standard forward pass and backward pass
+        loss = super().training_step(model, inputs)
+        
+        # Apply gradient projection if misalignment directions are provided
+        if self.misalignment_directions is not None:
+            for name, param in model.named_parameters():
+                if 'lora_' not in name or param.grad is None:
+                    continue
+                
+                # Get the misalignment direction for this parameter
+                if name in self.misalignment_directions:
+                    u = self.misalignment_directions[name]  # Should be a normalized vector
+                    g = param.grad.flatten()
+                    
+                    # Project out the component along u: g_projected = g - (g·u)u
+                    g_projected = g - torch.dot(g, u) * u
+                    
+                    # Reshape back and assign
+                    param.grad = g_projected.view(param.shape)
+        
+        return loss
+
+
+class ProjectedGradientKLRegularizedSFTTrainer(KLRegularizedSFTTrainer):
+    """
+    KL-Regularized SFT Trainer with gradient projection.
+    """
+    
+    def __init__(self, misalignment_directions=None, **kwargs):
+        super().__init__(**kwargs)
+        self.misalignment_directions = misalignment_directions
+    
+    def training_step(self, model, inputs):
+        """
+        Perform a training step with gradient projection.
+        """
+        # Perform standard forward pass and backward pass
+        loss = super().training_step(model, inputs)
+        
+        # Apply gradient projection if misalignment directions are provided
+        if self.misalignment_directions is not None:
+            for name, param in model.named_parameters():
+                if 'lora_' not in name or param.grad is None:
+                    continue
+                
+                # Get the misalignment direction for this parameter
+                if name in self.misalignment_directions:
+                    u = self.misalignment_directions[name]  # Should be a normalized vector
+                    g = param.grad.flatten()
+                    
+                    # Project out the component along u: g_projected = g - (g·u)u
+                    g_projected = g - torch.dot(g, u) * u
+                    
+                    # Reshape back and assign
+                    param.grad = g_projected.view(param.shape)
+        
+        return loss
